@@ -36,15 +36,18 @@ COLUMNS = {
     "date":        "Order Date",     # required
     "order_id":    "Order ID",       # required (used to count orders)
     "sales":       "Sales",          # required
-    "profit":      "Profit",         # optional (margin charts skip if None)
+    "profit":      "Profit",         # optional (profit/margin charts skip if None)
+    "discount":    "Discount",       # optional (discount-vs-profit chart)
+    "customer":    "Customer Name",  # optional (customer concentration)
     "category":    "Category",       # optional
     "subcategory": "Sub-Category",   # optional
     "product":     "Product Name",   # optional
     "region":      "Region",         # optional
 }
 
-ACCENT = "#2563eb"   # primary colour
-ACCENT_2 = "#10b981" # secondary (profit)
+ACCENT = "#2563eb"    # primary colour
+ACCENT_2 = "#10b981"  # secondary (profit)
+LOSS = "#ef4444"      # negative / loss
 
 # ──────────────────────────────────────────────────────────────────
 # 2. PAGE SETUP
@@ -73,7 +76,7 @@ def load_data(source) -> pd.DataFrame:
     df = df.rename(columns={v: k for k, v in COLUMNS.items() if v})
     df["date"] = pd.to_datetime(df["date"], format=DATE_FORMAT, errors="coerce")
     df = df.dropna(subset=["date"])
-    for num in ("sales", "profit"):
+    for num in ("sales", "profit", "discount"):
         if num in df.columns:
             df[num] = pd.to_numeric(df[num], errors="coerce")
     return df
@@ -92,6 +95,9 @@ except Exception as e:
     st.stop()
 
 has_profit = "profit" in df.columns and df["profit"].notna().any()
+has_discount = "discount" in df.columns and df["discount"].notna().any()
+has_customer = "customer" in df.columns
+has_product = "product" in df.columns
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -110,8 +116,7 @@ else:
 def multiselect_filter(label, field):
     if field in df.columns:
         opts = sorted(df[field].dropna().unique())
-        chosen = st.sidebar.multiselect(label, opts, default=opts)
-        return chosen
+        return st.sidebar.multiselect(label, opts, default=opts)
     return None
 
 region_sel = multiselect_filter("Region", "region")
@@ -140,7 +145,6 @@ def period_metrics(frame):
     aov = (revenue / orders) if orders else 0
     return revenue, profit, margin, orders, aov
 
-# Build an equal-length immediately-preceding period for comparison.
 span = (pd.Timestamp(end_d) - pd.Timestamp(start_d))
 prev_start = pd.Timestamp(start_d) - span - pd.Timedelta(days=1)
 prev_end = pd.Timestamp(start_d) - pd.Timedelta(days=1)
@@ -173,13 +177,71 @@ else:
 
 st.caption("Deltas compare the selected range with the immediately "
            "preceding period of equal length.")
+
+
+# ──────────────────────────────────────────────────────────────────
+# 6. KEY TAKEAWAYS  — computed live from the filtered data
+# ──────────────────────────────────────────────────────────────────
+DISC_BINS = [-0.001, 0, 0.10, 0.20, 0.30, 0.50, 1.0]
+DISC_LABELS = ["0%", "1–10%", "11–20%", "21–30%", "31–50%", ">50%"]
+
+def discount_profit(frame):
+    f = frame.copy()
+    f["disc_band"] = pd.cut(f["discount"], bins=DISC_BINS, labels=DISC_LABELS)
+    return (f.groupby("disc_band", observed=True)["profit"]
+              .mean().reset_index())
+
+takeaways = []
+
+# (a) discount threshold where average profit turns negative
+if has_profit and has_discount:
+    dp = discount_profit(data)
+    neg_band = next((row["disc_band"] for _, row in dp.iterrows()
+                     if row["profit"] < 0), None)
+    if neg_band is not None:
+        takeaways.append(
+            f"Orders discounted at **{neg_band}** are, on average, "
+            f"**unprofitable** — discounting past this point destroys margin.")
+    else:
+        takeaways.append("No discount band is unprofitable on average — "
+                         "discounting is currently well-controlled.")
+
+# (b) customer concentration (top 10%)
+if has_customer:
+    cust = data.groupby("customer")["sales"].sum().sort_values(ascending=False)
+    n_top = max(1, (len(cust) + 9) // 10)  # ceil of 10%
+    share = cust.head(n_top).sum() / cust.sum() * 100 if cust.sum() else 0
+    takeaways.append(
+        f"Your **top 10% of customers** ({n_top}) drive "
+        f"**{share:.0f}%** of revenue.")
+
+# (c) do bestsellers = top earners?
+if has_profit and has_product:
+    top_rev = set(data.groupby("product")["sales"].sum()
+                      .sort_values(ascending=False).head(10).index)
+    top_prof = set(data.groupby("product")["profit"].sum()
+                       .sort_values(ascending=False).head(10).index)
+    overlap = len(top_rev & top_prof)
+    prod_profit = data.groupby("product")["profit"].sum()
+    n_loss = int((prod_profit < 0).sum())
+    takeaways.append(
+        f"Only **{overlap} of your top 10 sellers** are also in the "
+        f"top 10 by profit — revenue ≠ profit.")
+    if n_loss:
+        takeaways.append(
+            f"**{n_loss} products** lose money overall (negative total profit).")
+
+if takeaways:
+    st.subheader("🔑 Key takeaways")
+    st.info("\n\n".join(f"- {t}" for t in takeaways))
+
 st.divider()
 
 
 # ──────────────────────────────────────────────────────────────────
-# 6. CHARTS
+# 7. CHARTS
 # ──────────────────────────────────────────────────────────────────
-# 6a. Revenue (and profit) over time — monthly
+# 7a. Revenue (and profit) over time — monthly
 ts = (data.set_index("date")
           .resample("MS")
           .agg({"sales": "sum", **({"profit": "sum"} if has_profit else {})})
@@ -193,7 +255,7 @@ st.plotly_chart(fig_time, use_container_width=True)
 
 left, right = st.columns(2)
 
-# 6b. Sales by category / sub-category
+# 7b. Sales by sub-category / category
 if "subcategory" in data.columns:
     by_sub = (data.groupby("subcategory")["sales"].sum()
                   .sort_values(ascending=True).reset_index())
@@ -208,7 +270,7 @@ elif "category" in data.columns:
                      color_discrete_sequence=[ACCENT])
     left.plotly_chart(fig_cat, use_container_width=True)
 
-# 6c. Margin by category — the "high sales, thin margin" contrast
+# 7c. Margin by category — the "high sales, thin margin" contrast
 if has_profit and "category" in data.columns:
     m = data.groupby("category").agg(sales=("sales", "sum"),
                                      profit=("profit", "sum")).reset_index()
@@ -220,18 +282,51 @@ if has_profit and "category" in data.columns:
                            coloraxis_showscale=False)
     right.plotly_chart(fig_marg, use_container_width=True)
 
-# 6d. Top 10 products by revenue (concentration / Pareto)
-if "product" in data.columns:
-    top = (data.groupby("product")["sales"].sum()
-               .sort_values(ascending=False).head(10)
-               .sort_values(ascending=True).reset_index())
-    fig_top = px.bar(top, x="sales", y="product", orientation="h",
+# 7d. Discount vs profit — the signature insight
+if has_profit and has_discount:
+    dp = discount_profit(data)
+    dp["sign"] = dp["profit"].apply(lambda v: "Profit" if v >= 0 else "Loss")
+    fig_disc = px.bar(dp, x="disc_band", y="profit", color="sign",
+                      title="Average profit per order by discount level",
+                      color_discrete_map={"Profit": ACCENT_2, "Loss": LOSS},
+                      category_orders={"disc_band": DISC_LABELS})
+    fig_disc.update_layout(xaxis_title="Discount band", yaxis_title="Avg profit ($)",
+                           legend_title_text="")
+    fig_disc.add_hline(y=0, line_dash="dash", line_color="grey")
+    st.plotly_chart(fig_disc, use_container_width=True)
+    st.caption("Where the bars turn red, the average order at that discount "
+               "level loses money.")
+
+# 7e. Do bestsellers earn the most?  Top sellers + their actual profit
+if has_profit and has_product:
+    top_sellers = (data.groupby("product")
+                       .agg(sales=("sales", "sum"), profit=("profit", "sum"))
+                       .sort_values("sales", ascending=False).head(10)
+                       .sort_values("sales", ascending=True).reset_index())
+    top_sellers["short"] = top_sellers["product"].str.slice(0, 35) + "…"
+
+    c1, c2 = st.columns(2)
+    fig_rev = px.bar(top_sellers, x="sales", y="short", orientation="h",
                      title="Top 10 products by revenue",
                      color_discrete_sequence=[ACCENT])
-    fig_top.update_layout(yaxis_title="", xaxis_title="Sales ($)")
-    st.plotly_chart(fig_top, use_container_width=True)
+    fig_rev.update_layout(yaxis_title="", xaxis_title="Sales ($)")
+    c1.plotly_chart(fig_rev, use_container_width=True)
 
-# 6e. Sales by region
+    top_sellers["sign"] = top_sellers["profit"].apply(
+        lambda v: "Profit" if v >= 0 else "Loss")
+    fig_pf = px.bar(top_sellers, x="profit", y="short", orientation="h",
+                    color="sign", title="…and the profit those same sellers make",
+                    color_discrete_map={"Profit": ACCENT_2, "Loss": LOSS})
+    fig_pf.update_layout(yaxis_title="", xaxis_title="Profit ($)",
+                         legend_title_text="")
+    fig_pf.add_vline(x=0, line_dash="dash", line_color="grey")
+    c2.plotly_chart(fig_pf, use_container_width=True)
+    st.caption("Same products, sorted identically. If revenue meant profit, "
+               "both charts would line up — watch the ones that shrink or go red.")
+
+st.divider()
+
+# 7f. Sales by region
 if "region" in data.columns:
     by_reg = data.groupby("region")["sales"].sum().reset_index()
     fig_reg = px.bar(by_reg, x="region", y="sales", title="Sales by region",
@@ -239,6 +334,5 @@ if "region" in data.columns:
     fig_reg.update_layout(xaxis_title="", yaxis_title="Sales ($)")
     st.plotly_chart(fig_reg, use_container_width=True)
 
-st.divider()
 with st.expander("View underlying data"):
     st.dataframe(data, use_container_width=True)
